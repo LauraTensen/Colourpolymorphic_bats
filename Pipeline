@@ -1,0 +1,2172 @@
+
+------------------------------colour---------------------------------
+----------------------------polymorphic------------------------------
+-------------------------------bats----------------------------------
+
+---------------------------------------------------------------------
+#####################################################################
+##############################  ASTRAL  #############################
+#####################################################################
+---------------------------------------------------------------------
+
+# Reference genome - Myotis mystacinus
+GCA_964195625.1
+
+wget -O Reference.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/964/195/625/GCA_964195625.1_mMyoMys1.hap2.1/GCA_964195625.1_mMyoMys1.hap2.1_genomic.fna.gz
+
+wget -O Reference.gbff.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/964/195/625/GCA_964195625.1_mMyoMys1.hap2.1/GCA_964195625.1_mMyoMys1.hap2.1_genomic.gbff.gz
+
+## Get an index file:
+# Runtime = 23 min
+
+module load bwa/0.7.17
+
+bwa index Reference.fna
+samtools faidx Reference.fna
+
+# Make them executable:
+
+chmod +x GCF_024500275.1
+
+# clip reads
+module load fastp/0.23.1 
+
+for R1 in *_R1_001.fastq.gz
+do
+    sample=${R1%_R1_001.fastq.gz}
+    R2=${sample}_R2_001.fastq.gz
+
+    echo "Processing ${sample}"
+
+    fastp \
+        -i "$R1" \
+        -I "$R2" \
+        -o "${sample}_R1.trimmed.fastq.gz" \
+        -O "${sample}_R2.trimmed.fastq.gz" \
+        -3 \
+        -q 20 \
+        -l 50 \
+        -h "${sample}_fastp.html" \
+        -j "${sample}_fastp.json" \
+        > "${sample}_fastp.log" 2>&1
+
+done
+
+# Now we can align our sequences with BWA-MEM:
+# Runtime = 12h
+
+module load bwa/0.7.17
+module load samtools/1.12
+
+for R1 in *_R1.trimmed.fastq.gz
+do
+    sample=${R1%_R1.trimmed.fastq.gz}
+    R2=${sample}_R2.trimmed.fastq.gz
+
+    echo "Mapping ${sample}..."
+
+    bwa mem -t 4 Reference.fna "$R1" "$R2" | \
+        samtools sort -@ 4 -o "${sample}.bam"
+
+    samtools index "${sample}.bam"
+
+done
+
+# Qualiamp
+conda install bioconda::qualimap
+
+for bam in *.bam
+do
+    sample=${bam%.bam}
+
+    qualimap bamqc \
+        -bam "$bam" \
+        -outdir "${sample}_qualimap" \
+        -outfile "${sample}.pdf"
+
+done
+
+#---------- get results
+
+echo -e "Sample\tTotal_reads\tMapped_reads\tMapped_percent\tMean_depth\tCoverage_1x\tCoverage_5x\tCoverage_10x\tMean_mapping_quality" \
+    > qualimap_summary.tsv
+
+for file in *_qualimap/genome_results.txt
+do
+    folder=$(dirname "$file")
+    sample=${folder%_qualimap}
+
+    total_reads=$(awk -F'= ' '/number of reads =/ {
+        gsub(",", "", $2)
+        print $2
+        exit
+    }' "$file")
+
+    mapped_line=$(awk -F'= ' '/number of mapped reads =/ {
+        print $2
+        exit
+    }' "$file")
+
+    mapped_reads=$(echo "$mapped_line" |
+        awk '{gsub(",", "", $1); print $1}')
+
+    mapped_percent=$(echo "$mapped_line" |
+        grep -oP '\(\K[0-9.]+(?=%\))')
+
+    mean_depth=$(awk -F'= ' '/mean coverageData =/ {
+        print $2
+        exit
+    }' "$file")
+
+    coverage_1x=$(awk -F'= ' '/There is a 1X/ {
+        gsub("%", "", $2)
+        print $2
+        exit
+    }' "$file")
+
+    coverage_5x=$(awk -F'= ' '/There is a 5X/ {
+        gsub("%", "", $2)
+        print $2
+        exit
+    }' "$file")
+
+    coverage_10x=$(awk -F'= ' '/There is a 10X/ {
+        gsub("%", "", $2)
+        print $2
+        exit
+    }' "$file")
+
+    mean_mapq=$(awk -F'= ' '/mean mapping quality =/ {
+        print $2
+        exit
+    }' "$file")
+
+    echo -e "${sample}\t${total_reads}\t${mapped_reads}\t${mapped_percent}\t${mean_depth}\t${coverage_1x}\t${coverage_5x}\t${coverage_10x}\t${mean_mapq}" \
+        >> qualimap_summary.tsv
+done
+
+#--------------
+
+# Depth
+echo -e "Sample\tMean_depth" > mean_depth.tsv
+
+for bam in *.bam
+do
+    mean_depth=$(samtools depth -a "$bam" | awk '{sum+=$3} END {if(NR>0) print sum/NR; else print "NA"}')
+    echo -e "${bam%.bam}\t${mean_depth}" >> mean_depth.tsv
+done
+
+# Completeness
+
+conda install bioconda::busco
+
+busco -i assembly.fasta -l mammalia_odb10 -m genome -o busco_out
+
+#########################################################################
+##############################  GENE TREES  #############################
+#########################################################################
+
+# ------------------------------ make fasta files
+
+module load bcftools/1.15
+module load vcftools/0.1.16
+module load bedtools/2.30.0
+module load samtools/1.12
+
+#!/bin/bash
+
+REF="/Mystacinus.fna"
+OUTDIR="/FASTAS"
+
+mkdir -p "$OUTDIR"
+
+for bam in *.bam; do
+
+    sample="${bam%.bam}"
+
+    echo "Processing ${sample}..."
+
+    # Index BAM if needed
+    [[ -f "${bam}.bai" ]] || samtools index "$bam"
+
+    # ------------------------------------------------------------
+    # 1. Call variants
+    # ------------------------------------------------------------
+
+    bcftools mpileup \
+        -Ou \
+        -f "$REF" \
+        -a FORMAT/DP,FORMAT/AD \
+        -q 20 \
+        -Q 20 \
+        "$bam" |
+    bcftools call \
+        -m \
+        -Ou |
+    bcftools norm \
+        -f "$REF" \
+        -Oz \
+        -o "${OUTDIR}/${sample}.vcf.gz"
+
+    bcftools index -f "${OUTDIR}/${sample}.vcf.gz"
+
+    # ------------------------------------------------------------
+    # 2. Keep SNPs only
+    #
+    # Important:
+    # Indels must NOT be incorporated into the consensus because
+    # they change chromosome lengths and therefore shift the
+    # Mystacinus reference coordinates used by the GFF/BED files.
+    # ------------------------------------------------------------
+
+    bcftools view \
+        -v snps \
+        -Oz \
+        -o "${OUTDIR}/${sample}.snps.vcf.gz" \
+        "${OUTDIR}/${sample}.vcf.gz"
+
+    bcftools index -f "${OUTDIR}/${sample}.snps.vcf.gz"
+
+
+    # ------------------------------------------------------------
+    # 3. Mask positions with low read depth
+    # ------------------------------------------------------------
+
+    samtools depth \
+        -aa \
+        -q 20 \
+        -Q 20 \
+        "$bam" |
+    awk '$3 < 3 {print $1"\t"$2-1"\t"$2}' \
+        > "${OUTDIR}/${sample}_lowcoverage.bed"
+
+
+    # ------------------------------------------------------------
+    # 4. Add SNP positions with unreliable genotype calls
+    # ------------------------------------------------------------
+
+    bcftools query \
+        -i 'FMT/DP<3 || FMT/GQ<20' \
+        -f '%CHROM\t%POS0\t%POS\n' \
+        "${OUTDIR}/${sample}.snps.vcf.gz" \
+        >> "${OUTDIR}/${sample}_lowcoverage.bed"
+
+
+    # ------------------------------------------------------------
+    # 5. Sort and merge masked regions
+    # ------------------------------------------------------------
+
+    sort -k1,1 -k2,2n \
+        "${OUTDIR}/${sample}_lowcoverage.bed" |
+    bedtools merge \
+        > "${OUTDIR}/${sample}_mask.bed"
+
+
+    # ------------------------------------------------------------
+    # 6. Generate reference-coordinate consensus
+    #
+    # Only SNPs are inserted. Indels are excluded so every
+    # consensus sequence remains in Mystacinus coordinates.
+    # ------------------------------------------------------------
+
+    bcftools consensus \
+        -f "$REF" \
+        -H I \
+        -m "${OUTDIR}/${sample}_mask.bed" \
+        "${OUTDIR}/${sample}.snps.vcf.gz" \
+        > "${OUTDIR}/${sample}.fna"
+
+
+    # Index consensus FASTA
+    samtools faidx "${OUTDIR}/${sample}.fna"
+
+done
+
+echo "All consensus sequences generated."
+
+# ------------------------------ Coat colour genes
+
+# Get reference fastas
+
+# Role      Species Assembly
+#---------- Close relatives  
+Myotis mystacinus       GCA_964195625.1     # Reference
+Myotis brandtii         GCF_000412655.1
+Myotis daubentonii      GCF_963259705.1     # Annotation donor
+#---------- More distant 
+Myotis lucifugus        GCA_000147115.1
+Myotis myotis    GCF_014108235.1
+#---------- Outgroup (root) 
+Eptesicus fuscus        GCF_027574615.1
+
+# mystacinus
+wget -O Mystacinus.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/964/195/625/GCA_964195625.1_mMyoMys1.hap2.1/GCA_964195625.1_mMyoMys1.hap2.1_genomic.fna.gz
+
+# brandtii
+wget -O Brandtii.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/412/655/GCF_000412655.1_ASM41265v1/GCF_000412655.1_ASM41265v1_genomic.fna.gz
+
+# daubentonii
+wget -O Daubentonii.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/963/259/705/GCF_963259705.1_mMyoDau2.1/GCF_963259705.1_mMyoDau2.1_genomic.fna.gz
+
+wget -O Daubentonii.gff.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/963/259/705/GCF_963259705.1_mMyoDau2.1/GCF_963259705.1_mMyoDau2.1_genomic.gff.gz
+
+# lucifugus 
+wget -O Lucifugus.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/147/115/GCF_000147115.1_Myoluc2.0/GCF_000147115.1_Myoluc2.0_genomic.fna.gz
+
+# myotis
+wget -O Myotis.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/014/108/235/GCF_014108235.1_mMyoMyo1.p/GCF_014108235.1_mMyoMyo1.p_genomic.fna.gz
+
+# E. fuscus / outgroup
+wget -O Fuscus.fna.gz \
+https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/027/574/615/GCF_027574615.1_DD_ASM_mEF_20220401/GCF_027574615.1_DD_ASM_mEF_20220401_genomic.fna.gz
+
+# Index
+gunzip *.fna.gz
+
+for ref in *.fna
+do
+    samtools faidx "$ref"
+done
+
+# liftoff
+conda create -n liftoff_env \
+    -c conda-forge \
+    -c bioconda \
+    liftoff
+
+# Transfer the M. daubentonii annotation to M. mystacinus #Liftoff.sh
+liftoff \
+    Mystacinus.fna \
+    Lucifugus.fna \
+    -g Daubentonii.gff.gz \
+    -o Lucifugus.gff \
+    -u Lucifugus_unmapped.txt \
+    -p 8
+
+# ------------------------------ Coat colour genes
+
+# genes.txt
+MC1R
+ASIP
+TYR
+TYRP1
+DCT
+MITF
+KIT
+KITLG
+SOX10
+EDNRB
+PAX3
+PMEL
+SLC45A2
+SLC24A5
+OCA2
+RAB27A
+MLPH
+MYO5A
+CORIN
+MFSD12
+BNC2
+SLC7A11
+ATRN
+MAF
+LEF1
+WNT3A
+CTNNB1
+CREB1
+
+########################################
+# STEP 1. Extract CDS annotations once
+########################################
+
+GFF="Mystacinus.gff"
+GENE_LIST="genes.txt"
+
+mkdir -p candidate_gene_gff_longest
+
+while read -r gene; do
+
+    [[ -z "$gene" || "$gene" == \#* ]] && continue
+
+    echo "Processing $gene"
+
+    # Extract all CDS lines for this gene
+    awk -F'\t' -v gene="$gene" '
+        BEGIN {IGNORECASE=1}
+        $3=="CDS" &&
+        $9 ~ ("gene=" gene ";|gene=" gene "$|gene_name=" gene ";|gene_name=" gene "$")
+    ' "$GFF" > tmp_gene.gff
+
+    if [[ ! -s tmp_gene.gff ]]; then
+        echo "  No CDS found"
+        continue
+    fi
+
+    # Calculate total CDS length for each transcript
+    awk -F'\t' '
+        {
+            if (match($9,/Parent=([^;]+)/,a)) {
+                parent=a[1]
+                cdslen[parent] += ($5-$4+1)
+            }
+        }
+        END {
+            for (p in cdslen)
+                print p, cdslen[p]
+        }
+    ' tmp_gene.gff \
+    | sort -k2,2nr \
+    > tmp_transcripts.txt
+
+    # Select transcript with longest CDS
+    transcript=$(head -1 tmp_transcripts.txt | awk '{print $1}')
+
+    echo "  Selected: $transcript"
+
+    # Keep only CDS lines belonging to selected transcript
+    awk -F'\t' -v transcript="$transcript" '
+        $9 ~ ("Parent=" transcript ";") ||
+        $9 ~ ("Parent=" transcript "$")
+    ' tmp_gene.gff \
+    > "candidate_gene_gff_longest/${gene}.gff"
+
+done < "$GENE_LIST"
+
+rm -f tmp_gene.gff tmp_transcripts.txt
+
+
+########################################
+# STEP 2. Convert CDS coordinates to BED once
+########################################
+
+for gff in candidate_gene_gff_longest/*.gff; do
+    gene=$(basename "$gff" .gff)
+
+    awk -F'\t' -v gene="$gene" '
+        BEGIN {OFS="\t"}
+        $0 !~ /^#/ && $3=="CDS" {
+            print $1, $4-1, $5, gene, ".", $7
+        }
+    ' "$gff" > "candidate_gene_gff_longest/${gene}.bed"
+done
+
+
+########################################
+# STEP 3. Extract each gene from every individual
+########################################
+
+module load bedtools/2.30.0
+
+mkdir -p gene_fastas
+
+for fasta in *.fna; do
+
+    sample=$(basename "$fasta" .fna)
+
+    echo "Processing $sample"
+
+    mkdir -p "gene_fastas/${sample}"
+
+    for bed in candidate_gene_gff_longest/*.bed; do
+
+        gene=$(basename "$bed" .bed)
+
+        bedtools getfasta \
+            -fi "$fasta" \
+            -bed "$bed" \
+            -fo "gene_fastas/${sample}/${sample}_${gene}.fasta" \
+            -name \
+            -s
+
+    done
+done
+
+--- 
+
+# count base pairs
+seqkit stats *_raw.fasta > summary
+
+-----------------------------------------
+
+# Repeat for outgroups 
+# one species at a time - Brandttii, Daubentonii, Lucifugus, Myotis
+# still to do: Lucifugus, Myotis
+
+########################################
+# BRANDTII STEP A — extract candidate CDS
+########################################
+
+GFF="Lucifugus.gff"
+GENE_LIST="genes.txt"
+
+mkdir -p candidate_gene_gff_Lucifugus
+
+while read -r gene; do
+
+    [[ -z "$gene" || "$gene" == \#* ]] && continue
+
+    echo "Processing $gene"
+
+    # Extract all CDS lines for this gene
+    awk -F'\t' -v gene="$gene" '
+        BEGIN {IGNORECASE=1}
+        $3=="CDS" &&
+        $9 ~ ("gene=" gene ";|gene=" gene "$|gene_name=" gene ";|gene_name=" gene "$")
+    ' "$GFF" > tmp_gene.gff
+
+    if [[ ! -s tmp_gene.gff ]]; then
+        echo "  No CDS found"
+        continue
+    fi
+
+    # Calculate total CDS length for each transcript
+    awk -F'\t' '
+        {
+            if (match($9,/Parent=([^;]+)/,a)) {
+                parent=a[1]
+                cdslen[parent] += ($5-$4+1)
+            }
+        }
+        END {
+            for (p in cdslen)
+                print p, cdslen[p]
+        }
+    ' tmp_gene.gff \
+    | sort -k2,2nr \
+    > tmp_transcripts.txt
+
+    # Select transcript with longest CDS
+    transcript=$(head -1 tmp_transcripts.txt | awk '{print $1}')
+
+    echo "  Selected: $transcript"
+
+    # Keep only CDS lines belonging to selected transcript
+    awk -F'\t' -v transcript="$transcript" '
+        $9 ~ ("Parent=" transcript ";") ||
+        $9 ~ ("Parent=" transcript "$")
+    ' tmp_gene.gff \
+    > "candidate_gene_gff_Lucifugus/${gene}.gff"
+
+done < "$GENE_LIST"
+
+rm -f tmp_gene.gff tmp_transcripts.txt
+
+
+########################################
+# BRANDTII STEP B — GFF → BED
+########################################
+
+for gff in candidate_gene_gff_Lucifugus/*.gff; do
+
+    gene=$(basename "$gff" .gff)
+
+    awk -F'\t' -v gene="$gene" '
+        BEGIN {OFS="\t"}
+        $0 !~ /^#/ && $3=="CDS" {
+            print $1, $4-1, $5, gene, ".", $7
+        }
+    ' "$gff" > "candidate_gene_gff_Lucifugus/${gene}.bed"
+
+done
+
+########################################
+# BRANDTII STEP C — extract sequences
+########################################
+
+module load bedtools/2.30.0
+
+mkdir -p gene_fastas/Lucifugus
+
+for bed in candidate_gene_gff_Lucifugus/*.bed; do
+
+    gene=$(basename "$bed" .bed)
+
+    bedtools getfasta \
+        -fi Lucifugus.fna \
+        -bed "$bed" \
+        -fo "gene_fastas/Lucifugus/Lucifugus_${gene}.fasta" \
+        -name \
+        -s
+
+done
+
+-----------------------------------------
+
+# Continue combining all results
+
+########################################
+# STEP 4. Merge genes
+########################################
+
+#!/bin/bash
+
+cd /home/tensenl/BATS/FASTAS/OUTGROUPS
+
+mkdir -p merged_gene_fastas
+
+for dir in gene_fastas/*/; do
+
+    sample=$(basename "$dir")
+
+    echo "Processing $sample"
+
+    # Choose BED coordinates appropriate for this genome
+    case "$sample" in
+
+        D1|D2|D3|P1|P2|P3|P4|Mystacinus)
+            BEDDIR="candidate_gene_gff_longest"
+            ;;
+
+        Brandtii)
+            BEDDIR="candidate_gene_gff_Brandtii"
+            ;;
+
+        Daubentonii)
+            BEDDIR="candidate_gene_gff_Daubentonii"
+            ;;
+
+        Lucifugus)
+            BEDDIR="candidate_gene_gff_Lucifugus"
+            ;;
+
+        Fuscus)
+            BEDDIR="candidate_gene_gff_Fuscus"
+            ;;
+
+        Myotis)
+            BEDDIR="candidate_gene_gff_Myotis"
+            ;;
+
+        *)
+            echo "WARNING: no BED directory defined for $sample"
+            continue
+            ;;
+    esac
+
+
+    for file in "$dir"/*.fasta; do
+
+        filename=$(basename "$file" .fasta)
+
+        # e.g. P1_ASIP -> ASIP
+        gene="${filename#${sample}_}"
+
+        bed="${BEDDIR}/${gene}.bed"
+
+        if [[ ! -s "$bed" ]]; then
+            echo "WARNING: BED missing: $bed"
+            continue
+        fi
+
+        strand=$(awk 'NR==1 {print $6}' "$bed")
+
+        # Read every FASTA record as one CDS fragment
+        mapfile -t seqs < <(
+            awk '
+                /^>/ {
+                    if (seq != "") {
+                        print seq
+                        seq=""
+                    }
+                    next
+                }
+                {
+                    seq=seq $0
+                }
+                END {
+                    if (seq != "")
+                        print seq
+                }
+            ' "$file"
+        )
+
+        merged=""
+
+        if [[ "$strand" == "+" ]]; then
+
+            for seq in "${seqs[@]}"; do
+                merged="${merged}${seq}"
+            done
+
+        elif [[ "$strand" == "-" ]]; then
+
+            for ((i=${#seqs[@]}-1; i>=0; i--)); do
+                merged="${merged}${seqs[$i]}"
+            done
+
+        else
+            echo "WARNING: unknown strand for $sample $gene"
+            continue
+        fi
+
+        {
+            echo ">${sample}_${gene}"
+            echo "$merged"
+        } > "merged_gene_fastas/${sample}_${gene}.fasta"
+
+    done
+
+done
+
+
+########################################
+# STEP 5. Combine sequences
+########################################
+
+mkdir -p loci_combined
+
+INPUT_DIR="/merged_gene_fastas"
+OUTPUT_DIR="/loci_combined"
+
+cd "$INPUT_DIR"
+
+# Get unique gene names
+genes=$(ls *.fasta | sed 's/^[^_]*_//' | sed 's/\.fasta$//' | sort -u)
+
+echo "Combining loci by gene..."
+
+for gene in $genes; do
+
+    out="$OUTPUT_DIR/${gene}.fasta"
+    > "$out"
+
+    echo "COMBINE: $gene"
+
+    for f in *_${gene}.fasta; do
+
+        [[ -f "$f" ]] || continue
+
+        # Individual/species name = everything before _GENE.fasta
+        ind="${f%_${gene}.fasta}"
+
+        # Replace existing header with individual/species name
+        sed "s/^>.*/>$ind/" "$f" >> "$out"
+
+    done
+
+    # Count sequences
+    nseq=$(grep -c '^>' "$out" || true)
+
+    # Remove loci represented by fewer than 2 individuals
+    if [[ "$nseq" -lt 2 ]]; then
+        rm -f "$out"
+        echo "  -> removed (only $nseq sequence)"
+    else
+        echo "  -> $nseq sequences"
+    fi
+
+done
+
+echo "All genes combined."
+
+----------------- sanity check
+
+seqkit stats loci_combined/*.fasta
+
+########################################
+# STEP 6. MAFFT alignment
+########################################
+
+mkdir -p loci_aligned
+
+for fasta in loci_combined/*.fasta; do
+
+    gene=$(basename "$fasta" .fasta)
+
+    echo "Aligning $gene"
+
+    /home/tensenl/mafft/bin/mafft --auto "$fasta" \
+        > "loci_aligned/${gene}_aligned.fasta"
+
+done
+
+# --------- inspect
+
+seqkit stats loci_aligned/*.fasta
+
+# --------- quantify gaps:
+
+for f in loci_aligned/*.fasta; do
+    echo "===== $(basename "$f") ====="
+    seqkit fx2tab -n -l -g "$f"
+done > alignment_stats.txt
+
+########################################
+# STEP 7. Find candidate genes
+########################################
+
+# python script:
+# fixed_differences.py
+
+cd /home/tensenl/BATS/FASTAS/OUTGROUPS/loci_aligned
+
+python3 fixed_differences.py
+
+---
+
+column -t fixed_P_vs_D.tsv | less -S
+
+awk 'NR>1 {count[$1]++}
+
+END {
+    for (g in count)
+        print g, count[g]
+}' fixed_P_vs_D.tsv | sort -k2,2nr
+
+---
+
+########################################
+# STEP 8. Model Finder
+########################################
+
+---------------------------------------- Step 11. Model Finder 
+
+# list all loci
+ls *.fasta > file_list.txt
+
+# run ModelFinder on the sample (GNU parallel)
+cd /home/tensenl/BATS/OUTGROUPS/loci_aligned
+
+cat file_list.txt | parallel -j 1 '
+OUTFILE="sample_{/.}.iqtree"
+if [ ! -f "$OUTFILE" ]; then
+        iqtree3 \
+        -s {} \
+        -st DNA \
+        -m MFP \
+        -merit AIC \
+        -T 1 \
+        -pre sample_{/.}
+else
+    echo "$OUTFILE exists, skipping {}"
+fi
+'
+
+# get the chosen models from .iqtree files
+for f in sample_*.iqtree; do
+  awk '/Best-fit model/ {print FILENAME, $0}' $f
+done | sort | uniq -c | sort -nr
+
+
+# list best models
+for f in sample_*_mafft.log; do
+    locus=$(basename "$f" _mafft.log | sed 's/^sample_//')
+    model=$(grep "Best-fit model" "$f" | sed 's/.*: //')
+    echo -e "$locus\t$model"
+done > best_models_by_locus.tsv
+
+########################################
+# STEP 9. IQtree
+########################################
+
+# Run one IQ-TREE job per locus (use a Slurm array or GNU parallel). 
+
+# Example GNU parallel for a directory of alignments:
+ls *.fasta > loci_list.txt
+
+########################################
+# STEP 10. Astral species trees
+########################################
+
+---------------------------------------
+
+cd /home/tensenl/BATS/OUTGROUPS/loci_aligned/IQTREE
+
+cat *.treefile > Colour_trees.tre
+
+--------------------------------------- Step 12. ASTRAL-II 
+
+java -jar /home/tensenl/miniconda3/share/astral-tree-5.7.8-1/astral.5.7.8.jar \
+    -i /home/tensenl/BATS/FASTAS/OUTGROUPS/loci_aligned/TREES/Colour_trees.tre \
+    -o Astral_colour.tree
+
+#ASTRAL outputs a Newick tree with support values after the node:
+
+((A,B):0.2[0.95],(C,D):0.1[0.java -jar /home/tensenl/miniconda3/Astral/astral.5.7.8.jar \
+    -i BUSCO_trees.tre \
+    -o astral_species_tree.tree80]);
+
+# move to laptop
+scp brain:/home/tensenl/BATS/OUTGROUPS/loci_aligned/IQTREE/*treefile \
+~/Bats
+
+# Visualize in FigTree
+
+---------------------------------------------------------------------
+#####################################################################
+###############################  VEP  ###############################
+#####################################################################
+---------------------------------------------------------------------
+
+# Variant calling
+ls *bam > samples.txt
+
+# Bash
+module load bcftools/1.15
+
+bcftools mpileup \
+    -a AD,DP,SP \
+    -Ou \
+    -f Reference.fna \
+    -b samples.txt |
+bcftools call \
+    -a GQ,GP \
+    -m \
+    -Oz \
+    -o Bats.vcf.gz
+
+bcftools index -t Bats.vcf.gz
+
+# Filtering
+
+module load vcftools/0.1.16
+
+MAF=0.05
+maxmissing=0.9
+minQ=30
+minDP=7
+maxDP=40
+
+vcftools --gzvcf Bats.vcf.gz \
+  --remove-indels \
+  --maf $MAF \
+  --max-missing $maxmissing \
+  --minQ $minQ \
+  --min-meanDP $minDP \
+  --max-meanDP $maxDP \
+  --minDP $minDP \
+  --maxDP $maxDP \
+  --recode --stdout | gzip -c > Bats_filtered.vcf.gz
+
+---
+
+After filtering, kept 546870 out of a possible 1913393617 Sites
+
+---
+
+# reference genome Myotis mystacinus (GCA_964195625.11) 
+
+# Outgroups
+Myotis brandtii         GCF_000412655.1
+Myotis daubentonii      GCF_963259705.1     # Annotation donor
+
+# Index the caracal reference
+module load samtools/1.12
+
+samtools faidx mystacinus.fna
+samtools faidx brandtii.fna
+samtools faidx daubentonii.fna
+
+# Install minimap
+conda install bioconda::minimap2
+
+minimap2 -d mystacinus.mmi mystacinus.fna
+
+# brandtii → mystacinus coordinates
+minimap2 \
+    -t 16 \
+    -cx asm20 \
+    --cs \
+    --secondary=no \
+    mystacinus.fna \
+    brandtii.fna \
+    > brandtii_to_mystacinus.paf
+
+# daubentonii → mystacinus coordinates
+minimap2 \
+    -t 16 \
+    -cx asm20 \
+    --cs \
+    --secondary=no \
+    mystacinus.fna \
+    daubentonii.fna \
+    > daubentonii_to_mystacinus.paf
+
+# sort your PAFs first:
+sort -k6,6 -k8,8n brandtii_to_mystacinus.paf \
+    > brandtii_to_mystacinus.sorted.paf
+
+sort -k6,6 -k8,8n daubentonii_to_mystacinus.paf \
+    > daubentonii_to_mystacinus.sorted.paf
+
+# Generate outgroup-versus-bat VCFs
+paftools.js call \
+    -f mystacinus.fna \
+    brandtii_to_mystacinus.sorted.paf \
+    > brandtii_vs_mystacinus.vcf
+
+# Generate outgroup-versus-bat VCFs  
+paftools.js call \
+    -f mystacinus.fna \
+    daubentonii_to_mystacinus.sorted.paf \
+    > daubentonii_vs_mystacinus.vcf
+
+# sort, compress 
+bcftools sort brandtii_vs_mystacinus.vcf \
+    -Oz \
+    -o brandtii_vs_mystacinus.vcf.gz
+
+# sort, compress
+bcftools sort daubentonii_vs_mystacinus.vcf \
+    -Oz \
+    -o daubentonii_vs_mystacinus.vcf.gz
+
+# Index
+tabix -p vcf brandtii_vs_mystacinus.vcf.gz
+
+tabix -p vcf daubentonii_vs_mystacinus.vcf.gz
+
+----
+
+# For genetic-load analysis, retain only SNPs initially:
+bcftools view \
+    -v snps \
+    -m2 -M2 \
+    Bats_filtered.vcf.gz \
+    -Oz \
+    -o Bats.biallelic_snps.vcf.gz
+
+bcftools index -t Bats.biallelic_snps.vcf.gz
+
+# Normalize all three VCFs
+
+for vcf in \
+    Bats.biallelic_snps.vcf.gz \
+    brandtii_vs_mystacinus.vcf.gz \
+    daubentonii_vs_mystacinus.vcf.gz
+do
+    prefix=$(basename "$vcf" .vcf.gz)
+
+    bcftools norm \
+        -f mystacinus.fna \
+        -m -any \
+        "$vcf" \
+        -Oz \
+        -o "${prefix}.norm.vcf.gz"
+
+    bcftools index -t "${prefix}.norm.vcf.gz"
+done
+
+---
+
+#sort VCF files
+
+bcftools sort \
+    daubentonii_vs_mystacinus.norm.vcf.gz \
+    -Oz -o daubentonii_vs_mystacinus.norm.sorted.vcf.gz
+
+bcftools index -f -t daubentonii_vs_mystacinus.norm.sorted.vcf.gz
+
+bcftools index -n daubentonii_vs_mystacinus.norm.sorted.vcf.gz
+
+---
+
+bcftools sort \
+    brandtii_vs_mystacinus.norm.vcf.gz \
+    -Oz -o brandtii_vs_mystacinus.norm.sorted.vcf.gz
+
+bcftools index -f -t brandtii_vs_mystacinus.norm.sorted.vcf.gz
+
+bcftools index -n brandtii_vs_mystacinus.norm.sorted.vcf.gz
+
+---
+
+bcftools sort Bats.biallelic_snps.norm.vcf.gz \
+    -Oz -o Bats.biallelic_snps.norm.sorted.vcf.gz
+
+bcftools index -f -t Bats.biallelic_snps.norm.sorted.vcf.gz
+
+---
+
+# bcftools index -n daubentonii_vs_mystacinus.norm.sorted.vcf.gz
+33822395
+
+# bcftools index -n brandtii_vs_mystacinus.norm.sorted.vcf.gz
+14497594
+
+--- 
+
+# Remove ambiguities in brandtii and daubentonii genomes
+
+for species in brandtii daubentonii
+do
+    input="${species}_vs_mystacinus.vcf.gz"
+    filtered="${species}_vs_mystacinus.ACGT.vcf.gz"
+
+    gzip -dc "$input" |
+    awk 'BEGIN{FS=OFS="\t"}
+         /^#/ {print; next}
+         $4 ~ /^[ACGT]+$/ && $5 ~ /^[ACGT,]+$/ {print}' |
+    bgzip -c > "$filtered"
+
+    tabix -f -p vcf "$filtered"
+
+    bcftools norm \
+        -f mystacinus.fna \
+        -m -any \
+        "$filtered" \
+        -Oz \
+        -o "${species}_vs_mystacinus.norm.vcf.gz"
+
+    bcftools index -f -t "${species}_vs_mystacinus.norm.vcf.gz"
+done
+
+---
+
+# ============================================================
+# INPUTS
+# ============================================================
+
+REF=mystacinus.fna
+POP=Bats.biallelic_snps.norm.vcf.gz
+
+BR_PAF=brandtii_to_mystacinus.sorted.paf
+DA_PAF=daubentonii_to_mystacinus.sorted.paf
+
+BR_VCF=brandtii_vs_mystacinus.norm.sorted.vcf.gz
+DA_VCF=daubentonii_vs_mystacinus.norm.sorted.vcf.gz
+
+
+# ============================================================
+# STEP 1. Make BED files of confidently aligned outgroup regions
+# ============================================================
+
+# Keep primary/high-confidence mappings.
+# PAF columns:
+# 6 = target/reference chromosome
+# 8 = target start (0-based)
+# 9 = target end
+# 12 = MAPQ
+
+awk '$12 >= 20 {print $6"\t"$8"\t"$9}' "$BR_PAF" \
+    | sort -k1,1 -k2,2n \
+    | bedtools merge \
+    > brandtii.callable.bed
+
+awk '$12 >= 20 {print $6"\t"$8"\t"$9}' "$DA_PAF" \
+    | sort -k1,1 -k2,2n \
+    | bedtools merge \
+    > daubentonii.callable.bed
+
+# ============================================================
+# STEP 2. Find regions callable in BOTH outgroups
+# ============================================================
+
+bedtools intersect \
+    -a brandtii.callable.bed \
+    -b daubentonii.callable.bed \
+    > outgroups.callable.bed
+
+
+# Optional: merge again in case intersect produced adjacent pieces
+
+sort -k1,1 -k2,2n outgroups.callable.bed \
+    | bedtools merge \
+    > outgroups.callable.merged.bed
+
+# ============================================================
+# STEP 3. Restrict population SNPs to regions callable in both
+# ============================================================
+
+bcftools view \
+    -R outgroups.callable.merged.bed \
+    "$POP" \
+    -Oz \
+    -o Bats.callable_in_both_outgroups.vcf.gz
+
+bcftools index -t Bats.callable_in_both_outgroups.vcf.gz
+
+
+# ============================================================
+# STEP 4. Extract population SNP positions
+# ============================================================
+
+bcftools query \
+    -f '%CHROM\t%POS\t%REF\t%ALT\n' \
+    Bats.callable_in_both_outgroups.vcf.gz \
+    > population_sites.tsv
+
+# ============================================================
+# STEP 5. Extract outgroup variants at those population positions
+# ============================================================
+
+# Make a regions file for bcftools:
+awk '{print $1"\t"$2"\t"$2}' population_sites.tsv \
+    > population_sites.regions
+
+# Brandtii variants at population SNP positions
+
+bcftools view \
+    -R population_sites.regions \
+    "$BR_VCF" \
+    -Ou |
+bcftools query \
+    -f '%CHROM\t%POS\t%REF\t%ALT\n' \
+    > brandtii.at_population_sites.tsv
+
+# Daubentonii variants at population SNP positions
+
+bcftools view \
+    -R population_sites.regions \
+    "$DA_VCF" \
+    -Ou |
+bcftools query \
+    -f '%CHROM\t%POS\t%REF\t%ALT\n' \
+    > daubentonii.at_population_sites.tsv
+
+# ============================================================
+# STEP 6. Determine the allele carried by each outgroup
+# ============================================================
+
+# Start with the assumption that, at callable sites without
+# an outgroup variant record, the outgroup carries the
+# mystacinus REF allele.
+
+awk 'BEGIN{OFS="\t"} {
+    print $1,$2,$3,$4,$3
+}' population_sites.tsv \
+    > brandtii.states.tsv
+
+awk 'BEGIN{OFS="\t"} {
+    print $1,$2,$3,$4,$3
+}' population_sites.tsv \
+    > daubentonii.states.tsv
+
+
+# ============================================================
+# STEP 7. Replace REF with ALT wherever the outgroup has a SNP
+# ============================================================
+
+awk '
+BEGIN{FS=OFS="\t"}
+
+NR==FNR {
+    key=$1":"$2
+    alt[key]=$4
+    next
+}
+
+{
+    key=$1":"$2
+
+    if (key in alt)
+        $5=alt[key]
+
+    print
+}
+' brandtii.at_population_sites.tsv \
+  brandtii.states.tsv \
+  > brandtii.states.updated.tsv
+
+
+awk '
+BEGIN{FS=OFS="\t"}
+
+NR==FNR {
+    key=$1":"$2
+    alt[key]=$4
+    next
+}
+
+{
+    key=$1":"$2
+
+    if (key in alt)
+        $5=alt[key]
+
+    print
+}
+' daubentonii.at_population_sites.tsv \
+  daubentonii.states.tsv \
+  > daubentonii.states.updated.tsv
+
+
+# ============================================================
+# STEP 8. Keep only sites where the two outgroups agree
+# ============================================================
+
+paste \
+    brandtii.states.updated.tsv \
+    daubentonii.states.updated.tsv |
+awk '
+BEGIN{FS=OFS="\t"}
+
+{
+    chrom=$1
+    pos=$2
+    ref=$3
+    alt=$4
+
+    brandtii=$5
+    daubentonii=$10
+
+    # Require agreement between outgroups
+    if (brandtii != daubentonii)
+        next
+
+    # Require ancestral allele to equal either REF or ALT
+    # of the population SNP
+    if (brandtii != ref && brandtii != alt)
+        next
+
+    print chrom,pos,ref,alt,brandtii
+}
+' > ancestral.tsv
+
+
+# ============================================================
+# STEP 9. Compress and index annotation table
+# ============================================================
+
+bgzip -c ancestral.tsv > ancestral.tsv.gz
+
+tabix \
+    -s1 \
+    -b2 \
+    -e2 \
+    ancestral.tsv.gz
+
+
+# ============================================================
+# STEP 10. Create AA header
+# ============================================================
+
+echo '##INFO=<ID=AA,Number=1,Type=String,Description="Putative ancestral allele supported by Myotis brandtii and Myotis daubentonii">' \
+    > ancestral.hdr
+
+# ============================================================
+# STEP 11. Keep only polarized population SNPs
+# ============================================================
+
+bcftools view \
+    -R ancestral.tsv.gz \
+    Bats.callable_in_both_outgroups.vcf.gz \
+    -Oz \
+    -o Bats.polarizable.vcf.gz
+
+bcftools index -t Bats.polarizable.vcf.gz
+
+# ============================================================
+# STEP 12. Annotate ancestral allele
+# ============================================================
+
+bcftools annotate \
+    -a ancestral.tsv.gz \
+    -h ancestral.hdr \
+    -c CHROM,POS,REF,ALT,INFO/AA \
+    Bats.polarizable.vcf.gz \
+    -Oz \
+    -o Bats.ancestral.vcf.gz
+
+bcftools index -t Bats.ancestral.vcf.gz
+
+
+# ============================================================
+# STEP 13. QC
+# ============================================================
+
+echo "Original population SNPs:"
+bcftools view -H "$POP" | wc -l
+
+# 532192
+
+echo "Callable in both outgroups:"
+bcftools view -H Bats.callable_in_both_outgroups.vcf.gz | wc -l
+
+# 322276
+
+echo "Polarized SNPs:"
+bcftools view -H Bats.ancestral.vcf.gz | wc -l
+
+# 300528
+
+echo "AA=REF:"
+bcftools query -f '%REF\t%INFO/AA\n' Bats.ancestral.vcf.gz \
+    | awk '$1==$2' \
+    | wc -l
+
+# 297076
+
+echo "AA=ALT:"
+bcftools query -f '%ALT\t%INFO/AA\n' Bats.ancestral.vcf.gz \
+    | awk '$1==$2' \
+    | wc -l
+
+# 3452
+
+#----------------------- Genetic load
+
+# can convert the GBFF annotation into GFF3 using bp_genbank2gff3.pl, supplied by BioPerl:
+
+----
+
+# liftoff gff file
+conda create -n liftoff \
+    -c conda-forge \
+    -c bioconda \
+    liftoff
+
+conda activate liftoff
+
+liftoff \
+    -g cat.gff.gz \
+    -o caracal.liftoff.gff \
+    -u caracal.unmapped_features.txt \
+    Reference.fna \
+    cat.fna
+
+----
+
+# Transfer Daubentonii gene annotations onto the bMystacinus assembly
+
+
+# create ensembl-VEP environment:
+conda create -n vep \
+  -c conda-forge \
+  -c bioconda \
+  --strict-channel-priority \
+  ensembl-vep=116
+
+---
+
+(
+  grep "^#" Mystacinus.gff
+  grep -v "^#" Mystacinus.gff | \
+    sort -k1,1 -k4,4n -k5,5n -t$'\t'
+) | bgzip > Mystacinus.liftoff.sorted.gff.gz
+
+tabix -p gff Mystacinus.liftoff.sorted.gff.gz
+---
+
+# Load Conda
+source $HOME/.bashrc
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate vep
+
+# Run VEP
+vep \
+  --input_file Bats.ancestral.vcf.gz \
+  --format vcf \
+  --output_file Bats.vep.vcf \
+  --vcf \
+  --fasta Mystacinus.fna \
+  --gff Mystacinus.liftoff.sorted.gff.gz \
+  --force_overwrite \
+  --symbol \
+  --canonical
+
+# check results
+grep "^##INFO=<ID=CSQ" Bats.vep.vcf
+
+# check
+grep -v "^#" Bats.vep.vcf | \
+grep -c "CSQ="
+
+# response
+300319
+
+# check
+grep -v "^#" Bats.vep.vcf | \
+sed 's/.*CSQ=//' | \
+cut -d'|' -f2 | \
+sort | uniq -c | sort -nr | head -30
+
+# check
+grep -v "^#" Bats.vep.vcf | \
+sed 's/.*CSQ=//' | \
+cut -d'|' -f3 | \
+sort | uniq -c
+
+#response
+    208 HIGH
+   5183 LOW
+   4803 MODERATE
+ 290125 MODIFIER
+
+# For a genetic load analysis, we focus on derived load:
+# 1. High-impact (putative loss-of-function)
+stop_gained
+frameshift_variant
+splice_acceptor_variant
+splice_donor_variant
+start_lost
+stop_lost      # These are usually reported as LoF variants
+
+# 2. Moderate-impact (missense mutations)
+missense_variant
+
+# 3. Low-impact
+synonymous_variant
+
+---
+
+# python script:
+# count_derived_load.py
+
+cd /home/tensenl/BATS/OUTGROUPS
+
+python3 count_derived_load.py
+
+---
+
+# run it
+
+python count_derived_load.py \
+  Bats.vep.vcf \
+  Bats.derived_load.tsv
+
+---
+
+# Plot in R
+
+load <- read.delim("Bats.derived_load.tsv",
+                   header = TRUE,
+                   stringsAsFactors = FALSE)
+
+# clean it first:
+
+library(tidyverse)
+
+load <- load %>%
+  mutate(
+    sample = sub("\\.bam$", "", sample),
+    Morph = ifelse(grepl("^D", sample), "Dark", "Pale"),
+    sample = factor(sample,
+                    levels = c("D1", "D2", "D3",
+                               "P1", "P2", "P3", "P4")),
+    category = factor(
+      category,
+      levels = c("LoF_HIGH",
+                 "missense_MODERATE",
+                 "synonymous_LOW"),
+      labels = c("High-impact (LoF)",
+                 "Missense",
+                 "Synonymous")
+    )
+  )
+
+# summarize 21 values together:
+
+load %>%
+  select(
+    sample, Morph, category,
+    derived_alleles,
+    homozygous_derived_sites,
+    heterozygous_sites,
+    derived_alleles_per_1000_called_alleles
+  )
+
+
+#  check that callability really is identical:
+
+load %>%
+  group_by(category) %>%
+  summarise(
+    min_called = min(called_alleles),
+    max_called = max(called_alleles),
+    .groups = "drop"
+  )
+
+# category          min_called max_called
+#  <fct>                  <int>      <int>
+1 High-impact (LoF)        542        542
+2 Missense               11792      11792
+3 Synonymous             10638      10638
+
+# Plot
+
+ggplot(load,
+       aes(x = sample,
+           y = derived_alleles_per_1000_called_alleles,
+           fill = Morph)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~category, scales = "free_y") +
+  labs(
+    x = "Individual",
+    y = "Derived alleles per 1,000 called alleles",
+    fill = "Colour morph"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+# homozygous derived burden:
+
+ggplot(load,
+       aes(x = sample,
+           y = homozygous_derived_sites,
+           fill = Morph)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~category, scales = "free_y") +
+  labs(
+    x = "Individual",
+    y = "Homozygous derived sites",
+    fill = "Colour morph"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+# make ROH dataframe:
+froh <- tibble(
+  sample = factor(
+    c("D1","D2","D3","P1","P2","P3","P4"),
+    levels = c("D1","D2","D3","P1","P2","P3","P4")
+  ),
+  FROH = c(
+    1267259,
+    629361,
+    1590473,
+    2863632,
+    1965313,
+    3583068,
+    8165280
+  ) / 1896881110
+)
+
+load2 <- left_join(load, froh, by = "sample")
+
+# homozygous derived sites versus \(F_{\rm ROH}\):
+ggplot(load2,
+       aes(x = FROH,
+           y = homozygous_derived_sites,
+           colour = Morph,
+           label = sample)) +
+  geom_point(size = 3.5) +
+  geom_text(nudge_y = 5, show.legend = FALSE) +
+  facet_wrap(~category, scales = "free_y") +
+  labs(
+    x = expression(F[ROH]),
+    y = "Homozygous derived sites",
+    colour = "Colour morph"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+---
+
+# do genome-wide morph-associated variant screen
+
+# check your CSQ structure:
+
+bcftools +split-vep Bats.vep.vcf \
+  -f '%CHROM\t%POS\t%REF\t%ALT\t%SYMBOL\t%Consequence\t%IMPACT\t%HGVSc\t%HGVSp[\t%GT]\n' \
+  > morph_variants.tsv
+
+# Then in R
+
+v <- read.delim(
+  "morph_variants.tsv",
+  header = FALSE,
+  stringsAsFactors = FALSE
+)
+
+names(v) <- c(
+  "CHROM", "POS", "REF", "ALT",
+  "SYMBOL", "Consequence", "IMPACT",
+  "HGVSc", "HGVSp",
+  "D1", "D2", "D3",
+  "P1", "P2", "P3", "P4"
+)
+
+head(v)
+
+functional <- v %>%
+  filter(IMPACT %in% c("HIGH", "MODERATE"))
+
+fixed_DP <- functional %>%
+  filter(
+    (D1 == "0/0" & D2 == "0/0" & D3 == "0/0" &
+     P1 == "1/1" & P2 == "1/1" & P3 == "1/1" & P4 == "1/1") |
+      
+    (D1 == "1/1" & D2 == "1/1" & D3 == "1/1" &
+     P1 == "0/0" & P2 == "0/0" & P3 == "0/0" & P4 == "0/0")
+  )
+
+nrow(fixed_DP)
+
+fixed_DP %>%
+  select(
+    CHROM, POS, REF, ALT,
+    SYMBOL, Consequence, IMPACT, HGVSc, HGVSp,
+    D1:D3, P1:P4
+  )
+
+
+---
+
+gt_alt_count <- function(gt) {
+  case_when(
+    gt %in% c("0/0", "0|0") ~ 0,
+    gt %in% c("0/1", "1/0", "0|1", "1|0") ~ 1,
+    gt %in% c("1/1", "1|1") ~ 2,
+    TRUE ~ NA_real_
+  )
+}
+
+screen <- functional %>%
+  rowwise() %>%
+  mutate(
+    AF_D = mean(c(
+      gt_alt_count(D1),
+      gt_alt_count(D2),
+      gt_alt_count(D3)
+    ), na.rm = TRUE) / 2,
+
+    AF_P = mean(c(
+      gt_alt_count(P1),
+      gt_alt_count(P2),
+      gt_alt_count(P3),
+      gt_alt_count(P4)
+    ), na.rm = TRUE) / 2,
+
+    Delta_AF = abs(AF_P - AF_D)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(Delta_AF))
+
+---
+
+screen_all <- v %>%
+  filter(
+    IMPACT %in% c("HIGH", "MODERATE", "LOW")
+  ) %>%
+  mutate(
+    Class = case_when(
+      IMPACT == "HIGH" ~ "High-impact",
+      grepl("missense_variant", Consequence) ~ "Missense",
+      grepl("synonymous_variant", Consequence) ~ "Synonymous",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Class)) %>%
+  rowwise() %>%
+  mutate(
+    AF_D = mean(c(
+      gt_alt_count(D1),
+      gt_alt_count(D2),
+      gt_alt_count(D3)
+    ), na.rm = TRUE) / 2,
+
+    AF_P = mean(c(
+      gt_alt_count(P1),
+      gt_alt_count(P2),
+      gt_alt_count(P3),
+      gt_alt_count(P4)
+    ), na.rm = TRUE) / 2,
+
+    Delta_AF = abs(AF_P - AF_D)
+  ) %>%
+  ungroup()
+
+---
+
+morph_specific <- screen %>%
+  filter(
+    # ALT present in Pale, completely absent in Dark
+    (
+      D1 == "0/0" &
+      D2 == "0/0" &
+      D3 == "0/0" &
+      (P1 != "0/0" | P2 != "0/0" | P3 != "0/0" | P4 != "0/0")
+    ) |
+      
+    # ALT present in Dark, completely absent in Pale
+    (
+      P1 == "0/0" &
+      P2 == "0/0" &
+      P3 == "0/0" &
+      P4 == "0/0" &
+      (D1 != "0/0" | D2 != "0/0" | D3 != "0/0")
+    )
+  )
+
+--- 
+
+# print for Table
+
+print(morph_specific, n = Inf, width = Inf)
+
+write.csv(
+  morph_specific,
+  "Morph_specific_functional_variants.csv",
+  row.names = FALSE
+)
+
+---------------------------------------------------------------------
+#####################################################################
+###############################  ROH  ###############################
+#####################################################################
+---------------------------------------------------------------------
+
+
+# Run ROHs for the 21 autosomal chromosomes
+
+bgzip Bats_filtered.vcf
+
+tabix -p vcf Bats_filtered.vcf.gz
+
+# generate a chromosome list
+
+seq 77851 77871 | sed 's/^/OZ0/; s/$/.1/' > autosomes.txt
+
+# Generate per-state output (r) 
+
+module load bcftools/1.15
+
+AUTOSOMES=$(paste -sd, autosomes.txt)
+
+bcftools roh \
+  -G 30 \
+  -e - \
+  -r "$AUTOSOMES" \
+  Bats_filtered.vcf.gz \
+  -O r \
+  -o ROH_bats_autosomes.txt
+
+# summarize the number per sample:
+awk '$1=="RG"{count[$2]++} END{for(i in count) print i, count[i]}' \
+ROH_bats_autosomes.txt
+
+# Total ROH length per sample:
+
+awk '$1=="RG"{sum[$2]+=$6} END{for(i in sum) print i, sum[i]}' \
+ROH_bats_autosomes.txt
+
+# Plot in R
+
+setwd("C:/Plotting/Bats")
+
+# 1. Read and clean the ROH output
+
+library(tidyverse)
+
+roh <- read.table(
+  "ROH_bats_autosomes.txt",
+  header = FALSE,
+  comment.char = "#",
+  fill = TRUE
+)
+
+# Keep ROH-region (RG) rows
+
+roh <- roh %>%
+  filter(V1 == "RG") %>%
+  transmute(
+    Sample = sub("\\.bam$", "", V2),
+    Chr = V3,
+    Start = as.numeric(V4),
+    End = as.numeric(V5),
+    Length = as.numeric(V6)
+  )
+
+roh
+
+# Then give the chromosomes sensible names:
+
+chr_names <- paste0("OZ0", 77851:77871, ".1")
+
+chr_key <- data.frame(
+  Chr = chr_names,
+  Chr_num = 1:21
+)
+
+roh <- roh %>%
+  left_join(chr_key, by = "Chr")
+
+# 2. ROHs across the genome
+
+# Read chromosome lengths
+fai <- read.table("Mystacinus.fna.fai", header = FALSE)
+
+chr_lengths <- fai %>%
+  transmute(
+    Chr = V1,
+    Length = V2
+  ) %>%
+  filter(Chr %in% chr_names) %>%
+  left_join(chr_key, by = "Chr") %>%
+  arrange(Chr_num) %>%
+  mutate(
+    offset = lag(cumsum(Length), default = 0),
+    midpoint = offset + Length / 2
+  )
+
+# Add cumulative genomic coordinates
+roh_plot <- roh %>%
+  left_join(
+    chr_lengths %>% select(Chr, offset),
+    by = "Chr"
+  ) %>%
+  mutate(
+    genome_start = Start + offset,
+    genome_end = End + offset,
+    Morph = ifelse(grepl("^D", Sample), "Dark", "Pale"),
+    Sample = factor(
+      Sample,
+      levels = c("D1", "D2", "D3", "P1", "P2", "P3", "P4")
+    )
+  )
+
+# Then plot:
+
+ggplot(roh_plot) +
+  geom_segment(
+    aes(
+      x = genome_start,
+      xend = genome_end,
+      y = Sample,
+      yend = Sample,
+      colour = Morph
+    ),
+    linewidth = 4,
+    lineend = "round"
+  ) +
+  scale_x_continuous(
+    breaks = chr_lengths$midpoint,
+    labels = chr_lengths$Chr_num,
+    expand = c(0.01, 0.01)
+  ) +
+  scale_y_discrete(limits = rev) +
+  labs(
+    x = "Chromosome",
+    y = NULL,
+    colour = "Colour morph"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(size = 9),
+    axis.ticks.x = element_blank(),
+    legend.position = "top"
+  )
+
+# 3. Add chromosome boundaries
+
+ggplot(roh_plot) +
+  geom_vline(
+    xintercept = chr_lengths$offset[-1],
+    linewidth = 0.25,
+    colour = "grey85"
+  ) +
+  geom_segment(
+    aes(
+      x = genome_start,
+      xend = genome_end,
+      y = Sample,
+      yend = Sample,
+      colour = Morph
+    ),
+    linewidth = 3.5,
+    lineend = "round"
+  ) +
+  scale_x_continuous(
+    breaks = chr_lengths$midpoint,
+    labels = chr_lengths$Chr_num,
+    expand = c(0.005, 0.005)
+  ) +
+  scale_y_discrete(limits = rev) +
+  labs(
+    x = "Chromosome",
+    y = NULL,
+    colour = "Colour morph"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_text(size = 8),
+    legend.position = "top"
+  )
+
+# There are many very short inferred ROHs. ≥100 kb is probaly of biological interest
+
+#  incorporate that directly:
+roh <- read.table(
+  "ROH_bats_autosomes.txt",
+  header = FALSE,
+  comment.char = "#",
+  fill = TRUE
+) %>%
+  filter(V1 == "RG") %>%
+  transmute(
+    Sample = sub("\\.bam$", "", V2),
+    Chr = V3,
+    Start = as.numeric(V4),
+    End = as.numeric(V5),
+    Length = as.numeric(V6),
+    Markers = as.numeric(V7),
+    Quality = as.numeric(V8)
+  ) %>%
+  mutate(
+    Length_kb = Length / 1000,
+    Length_Mb = Length / 1e6,
+    Morph = ifelse(grepl("^D", Sample), "Dark", "Pale")
+  )
+
+# inspect the length distribution:
+
+ggplot(roh, aes(x = Length_kb, fill = Morph)) +
+  geom_histogram(
+    bins = 30,
+    alpha = 0.7,
+    position = "identity"
+  ) +
+  labs(
+    x = "ROH length (kb)",
+    y = "Number of ROHs",
+    fill = "Colour morph"
+  ) +
+  theme_classic(base_size = 12)
+
+# Then see how many survive different thresholds:
+
+roh %>%
+  summarise(
+    total = n(),
+    `>50 kb` = sum(Length >= 50000),
+    `>100 kb` = sum(Length >= 100000),
+    `>500 kb` = sum(Length >= 500000),
+    `>1 Mb` = sum(Length >= 1000000)
+  )
+
+# And per individual:
+
+roh %>%
+  group_by(Sample, Morph) %>%
+  summarise(
+    Total = n(),
+    `>50 kb` = sum(Length >= 50000),
+    `>100 kb` = sum(Length >= 100000),
+    `>500 kb` = sum(Length >= 500000),
+    `>1 Mb` = sum(Length >= 1000000),
+    .groups = "drop"
+  )
+
+# If you decide on ≥100 kb, then simply:
+
+roh100 <- roh %>%
+  filter(Length >= 100000)
+
+# and use roh100 for the genomic ROH plot
+
+roh <- roh %>%
+  mutate(
+    ROH_bin = cut(
+      Length / 1e6,
+      breaks = c(-Inf, 0.1, 0.25, 0.5, Inf),
+      labels = c("<0.1 Mb",
+                 "0.1–0.25 Mb",
+                 "0.25–0.5 Mb",
+                 ">0.5 Mb"),
+      right = FALSE
+    ),
+    Sample = factor(
+      Sample,
+      levels = c("D1", "D2", "D3", "P1", "P2", "P3", "P4")
+    )
+  )
+
+roh_counts <- roh %>%
+  count(Sample, Morph, ROH_bin)
+
+ggplot(roh_counts,
+       aes(x = Sample, y = n, fill = ROH_bin)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  labs(
+    x = "Individual",
+    y = "ROH count",
+    fill = "ROH length"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+# proportion of genome in short versus long ROHs
+
+genome_size <- 1896881110
+
+roh_froh <- roh %>%
+  group_by(Sample, Morph, ROH_bin) %>%
+  summarise(
+    ROH_length = sum(Length),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    FROH = ROH_length / genome_size
+  )
+
+ggplot(roh_froh,
+       aes(x = Sample, y = FROH, fill = ROH_bin)) +
+  geom_col(width = 0.7) +
+  labs(
+    x = "Individual",
+    y = expression(F[ROH]),
+    fill = "ROH length"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+# Then:
+ggplot(roh_ratio,
+       aes(x = Sample, y = FROH_class, fill = ROH_class)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  labs(
+    x = "Individual",
+    y = expression(F[ROH]),
+    fill = "ROH length"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+# d make one stacked bar per bat, where the total bar height = total \(F_{\mathrm{ROH}}\) and the colours show how much comes from each ROH length class.
+ggplot(roh_ratio,
+       aes(x = Sample, y = FROH_class, fill = ROH_class)) +
+  geom_col(width = 0.7) +
+  labs(
+    x = "Individual",
+    y = expression(F[ROH]),
+    fill = "ROH length"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+  summary(roh$Length / 1e6)
+
+sort(roh$Length / 1e6)
